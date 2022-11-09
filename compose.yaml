@@ -1,0 +1,702 @@
+secrets:
+  porkbun_api_key:
+    file: ${SECRETS_DIR}/porkbun_api_key
+  porkbun_secret_api_key:
+    file: ${SECRETS_DIR}/porkbun_secret_api_key
+  web_username:
+    file: ${SECRETS_DIR}/web_username
+  web_password:
+    file: ${SECRETS_DIR}/web_password
+  db_root_password:
+    file: ${SECRETS_DIR}/db_root_password
+  db_password:
+    file: ${SECRETS_DIR}/db_password
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.18.0.0/24
+
+  socket_net:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.18.1.0/24
+
+  db:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.18.3.0/24
+
+
+services:
+
+######### PROXY #########
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket-proxy
+    # profiles: [disabled]
+    restart: unless-stopped
+    networks:
+      - socket_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOG_LEVEL=info # debug,info,notice,warning,err,crit,alert,emerg
+      - CONTAINERS=1
+      - IMAGES=1
+    labels:
+      - diun.watch_repo=true
+      - diun.max_tags=2
+
+  # Traefik - Reverse Proxy
+  traefik:
+    image: traefik:v2.9
+    container_name: traefik
+    # profiles: [disabled]
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    networks:
+      - default
+      - socket_net
+    ports:
+      - "80:80"
+      - "443:443"
+      # - "8080:8080"
+    volumes:
+      - ${CONFIG_DIR}/letsencrypt:/letsencrypt
+      - ${CONFIG_DIR}/traefik/dynamic:/dynamic
+      # - ${CONFIG_DIR}/traefik/logs/access.log:/access.log
+    command:
+      # General config
+      - --global.checkNewVersion=false
+      # - --log.level=DEBUG #  DEBUG, PANIC, FATAL, ERROR, WARN, INFO. Default=Error
+      # - --accesslog=true
+      # - --accesslog.filepath=/access.log
+      # - --api.insecure=true # Enable insecure access to api and dashboard on port 8080
+      - --api=true  # Enable api and dashboard that can be referenced in a router
+      - --serverstransport.insecureskipverify=true # Skip verifying self-signed certs, needed for Nextcloud.
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls=true # Apply TLS to make all routes using this entrypoint https
+      - --entrypoints.websecure.http.tls.options=mytls@file
+      - --entrypoints.websecure.http.tls.certResolver=myresolver
+      - --entrypoints.websecure.http.tls.domains[0].main=${LOCAL_DOMAIN}
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.${LOCAL_DOMAIN}
+      # Certificates
+      - --certificatesresolvers.myresolver.acme.dnschallenge=true
+      - --certificatesresolvers.myresolver.acme.dnschallenge.provider=porkbun
+      #- --certificatesresolvers.myresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory  # Test Server
+      - --certificatesresolvers.myresolver.acme.email=${EMAIL}
+      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+      # Docker Provider
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://socket-proxy:2375 # Use the socket-proxy
+      - --providers.docker.exposedbydefault=false
+      # File Provider
+      - --providers.file.directory=/dynamic
+      - --providers.file.watch=true
+    environment:
+      - PORKBUN_API_KEY_FILE=/run/secrets/porkbun_api_key
+      - PORKBUN_SECRET_API_KEY_FILE=/run/secrets/porkbun_secret_api_key
+    secrets:
+      - porkbun_api_key
+      - porkbun_secret_api_key
+    labels:
+      # TRAEFIK
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`dash.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.service=api@internal # Specify the service
+      - traefik.http.routers.api.middlewares=myipwhitelist@file
+      # Attach to middleware chain
+      # - traefik.http.routers.api.middlewares=api-secured
+      # Create middleware chain
+      # - traefik.http.middlewares.api-secured.chain.middlewares=api-ipwhitelist,api-auth
+      # - traefik.http.middlewares.api-secured.chain.middlewares=api-ipwhitelist
+      # Create basic ipwhitelist and auth middleware
+      # - traefik.http.middlewares.api-ipwhitelist.ipwhitelist.sourcerange=x.x.x.x
+      # - traefik.http.middlewares.api-auth.basicauth.users=${AUTH_USER}:${AUTH_PASSWORD}
+      # DIUN
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d{0,}|latest)$$
+
+
+######### VPN ##########
+
+  # Gluetun VPN Client
+  gluetun:
+    image: qmcgaw/gluetun:v3.32
+    container_name: gluetun
+    #profiles: [disabled]
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8888:8888/tcp" # HTTP proxy
+    volumes:
+      - ${CONFIG_DIR}/gluetun:/gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VERSION_INFORMATION=off
+      - UPDATER_PERIOD=24h # Update VPN Server ip addresses
+      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER}
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${VPN_SERVER_WIREGUARD_ADDRESS}
+      - SERVER_CITIES=${VPN_SERVER}
+      # - FIREWALL=off
+      # - FIREWALL_DEBUG=on
+      - FIREWALL_VPN_INPUT_PORTS=${VPN_INPUT_PORT}
+      - FIREWALL_OUTBOUND_SUBNETS=172.18.0.99/32 # Allow connection to calibre
+      - HTTPPROXY=on
+      - HTTPPROXY_STEALTH=on
+      #- HTTPPROXY_LOG=on
+      - HTTPPROXY_USERNAME=/run/secrets/web_username
+      - HTTPPROXY_PASSWORD=/run/secrets/web_password
+      - BLOCK_MALICIOUS=off
+    secrets:
+      - web_username
+      - web_password
+    labels:
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(v\\d+.\\d+.\\d{0,}|latest)$$
+
+
+######### DOWNLOADERS ##########
+
+# Transmission Bittorrent Client
+  transmission:
+    image: ghcr.io/linuxserver/transmission
+    container_name: transmission
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/transmission:/config
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${DOWNLOAD_DIR}/watch:/watch
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.transmission.rule=Host(`transmission.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.transmission.entrypoints=websecure
+      - traefik.http.routers.transmission.middlewares=myipwhitelist@file
+      - traefik.http.services.transmission.loadbalancer.server.port=9091
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+\\.\\d+\\d{0,}-r\\d-ls\\d{0,}|latest)$$
+
+
+######### SEARCHERS ##########
+
+# Prowlarr – Torrent Proxy / Indexer
+  prowlarr:
+    image: ghcr.io/linuxserver/prowlarr:develop
+    container_name: prowlarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/prowlarr:/config
+      - ${DOWNLOAD_DIR}:/downloads
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.prowlarr.rule=Host(`prowlarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.prowlarr.entrypoints=websecure
+      - traefik.http.routers.prowlarr.middlewares=myipwhitelist@file
+      - traefik.http.services.prowlarr.loadbalancer.server.port=9696
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(develop-\\d+.\\d+.\\d+.\\d{0,}-ls\\d{0,}|develop)$$
+
+
+######### MEDIA MANAGEMENT ##########
+
+# Sonarr – TV Show Download and Management
+  sonarr:
+    image: ghcr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/sonarr:/config
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${MEDIA_DIR}/Tv:/tv
+      - ${MEDIA_DIR}/Anime:/anime
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.sonarr.rule=Host(`sonarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.sonarr.entrypoints=websecure
+      - traefik.http.routers.sonarr.middlewares=myipwhitelist@file
+      - traefik.http.services.sonarr.loadbalancer.server.port=8989
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Radarr – Movie Download and Management
+  radarr:
+    image: ghcr.io/linuxserver/radarr
+    container_name: radarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/radarr:/config
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${MEDIA_DIR}/Movies:/movies
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.radarr.rule=Host(`radarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.radarr.entrypoints=websecure
+      - traefik.http.routers.radarr.middlewares=myipwhitelist@file
+      - traefik.http.services.radarr.loadbalancer.server.port=7878
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Lidarr – Music Download and Management
+  lidarr:
+    image: ghcr.io/linuxserver/lidarr
+    container_name: lidarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/lidarr:/config
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${MEDIA_DIR}/Music:/music
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.lidarr.rule=Host(`lidarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.lidarr.entrypoints=websecure
+      - traefik.http.routers.lidarr.middlewares=myipwhitelist@file
+      - traefik.http.services.lidarr.loadbalancer.server.port=8686
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Readarr – Book Download and Management
+  readarr:
+    image: ghcr.io/linuxserver/readarr:nightly
+    container_name: readarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/readarr:/config
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${MEDIA_DIR}/Calibre Library:/data/Calibre Library
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=docker_default
+      - traefik.http.routers.readarr.rule=Host(`readarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.readarr.entrypoints=websecure
+      - traefik.http.routers.readarr.middlewares=myipwhitelist@file
+      - traefik.http.services.readarr.loadbalancer.server.port=8787
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(nightly-\\d+.\\d+.\\d+.\\d{0,}-ls\\d{0,}|nightly|develop)$$
+
+# Bazarr – Subtitle Download and Management
+  bazarr:
+    image: ghcr.io/linuxserver/bazarr
+    container_name: bazarr
+    #profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${CONFIG_DIR}/bazarr:/config
+      - ${MEDIA_DIR}/Movies/:/movies
+      - ${MEDIA_DIR}/Tv:/tv
+      - ${MEDIA_DIR}/Anime:/anime
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.bazarr.rule=Host(`bazarr.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.bazarr.entrypoints=websecure
+      - traefik.http.routers.bazarr.middlewares=myipwhitelist@file
+      - traefik.http.services.bazarr.loadbalancer.server.port=6767
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(v\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Calibre – Ebook management
+  calibre:
+    image: ghcr.io/linuxserver/calibre:latest
+    container_name: calibre
+    #profiles: [disabled]
+    restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.18.0.99 # set static ip so readarr can connect
+    volumes:
+      - ${CONFIG_DIR}/calibre:/config
+      - ${MEDIA_DIR}/Calibre Library:/data/Calibre Library
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    security_opt:
+      - seccomp=unconfined # Fix blank screen
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=docker_default
+      - traefik.http.routers.calibre.rule=Host(`calibre.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.calibre.entrypoints=websecure
+      - traefik.http.routers.calibre.middlewares=myipwhitelist@file
+      - traefik.http.services.calibre.loadbalancer.server.port=8080
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(v\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Deemix - Download Music from Deezer
+  deemix:
+    image: registry.gitlab.com/bockiii/deemix-docker
+    container_name: deemix
+    profiles: [disabled]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    volumes:
+      - ${DOWNLOAD_DIR}/deemix:/downloads
+      - ${CONFIG_DIR}/deemix:/config
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DEEMIX_SINGLE_USER=true
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deemix.rule=Host(`deemix.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.deemix.entrypoints=websecure
+      - traefik.http.routers.deemix.middlewares=myipwhitelist@file
+      - traefik.http.services.deemix.loadbalancer.server.port=6595
+
+# FreshRSS - RSS feed aggregator
+  freshrss:
+    image: ghcr.io/linuxserver/freshrss:latest
+    container_name: freshrss
+    #profiles: [disabled]
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/freshrss:/config
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.freshrss.rule=Host(`freshrss.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.freshrss.entrypoints=websecure
+      - traefik.http.routers.freshrss.middlewares=myipwhitelist@file
+      - traefik.http.services.freshrss.loadbalancer.server.port=80
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+# Jellyfin - Free Software Media System
+  jellyfin:
+    image: ghcr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    #profiles: [disabled]
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ${CONFIG_DIR}/jellyfin:/config
+      - /tmp/jellyfin-transcodes:/config/data/transcodes
+      - ${MEDIA_DIR}/Movies:/data/movies
+      - ${MEDIA_DIR}/Tv:/data/tv
+      - ${MEDIA_DIR}/Anime:/data/anime
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jellyfin.rule=Host(`jellyfin.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.jellyfin.entrypoints=websecure
+      - traefik.http.services.jellyfin.loadbalancer.server.port=8096
+      - diun.watch_repo=false
+      - diun.max_tags=2
+      # - diun.include_tags=^(\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+######### NOTIFICATION ##########
+
+# Docker Image Update Notifier - Receive notifications when a docker image is updated
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    profiles: [disabled]
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    networks:
+      - default
+      - socket_net
+    volumes:
+      - ${CONFIG_DIR}/diun/data:/data
+      - ${CONFIG_DIR}/diun/custom-images.yml:/custom-images.yml:ro
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: serve
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+      - LOG_JSON=false
+      - DIUN_WATCH_WORKERS=10
+      - DIUN_WATCH_SCHEDULE=0 */6 * * *
+      #- DIUN_WATCH_FIRSTCHECKNOTIF=false
+      - DIUN_PROVIDERS_DOCKER=true
+      - DIUN_PROVIDERS_DOCKER_ENDPOINT=tcp://socket-proxy:2375
+      - DIUN_PROVIDERS_DOCKER_WATCHSTOPPED=true
+      - DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true # watch all
+      - DIUN_PROVIDERS_FILE_FILENAME=/custom-images.yml
+      - DIUN_NOTIF_GOTIFY_ENDPOINT=https://gotify.${LOCAL_DOMAIN}
+      - DIUN_NOTIF_GOTIFY_TOKEN=${GOTIFY_DIUN_TOKEN}
+      - DIUN_NOTIF_GOTIFY_PRIORITY=1
+      - DIUN_NOTIF_GOTIFY_TEMPLATETITLE={{ .Entry.Image.Path }}:{{ .Entry.Image.Tag }}
+      - DIUN_NOTIF_GOTIFY_TEMPLATEBODY=Docker tag {{ if .Entry.Image.HubLink }}[**{{ .Entry.Image }}**]({{ .Entry.Image.HubLink }}){{ else }}**{{ .Entry.Image }}**{{ end }} {{ if (eq .Entry.Status \new\) }}is available{{ else }}has been updated{{ end }}. {{ .Entry.Image.Digest }}
+      #- DIUN_NOTIF_MAIL_HOST=${SMTP_SERVER}
+      #- DIUN_NOTIF_MAIL_USERNAME=${SMTP_USERNAME}
+      #- DIUN_NOTIF_MAIL_PASSWORD=${SMTP_PASSWORD}
+      #- DIUN_NOTIF_MAIL_FROM=${SMTP_FROM}
+      #- DIUN_NOTIF_MAIL_TO=${SMTP_TO}
+      #- DIUN_NOTIF_MAIL_SSL=true
+      #- DIUN_NOTIF_MAIL_PORT=465
+    labels:
+      - diun.enable=true
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d{0,}|latest)$$
+
+# Gotify - a simple server for sending and receiving messages
+  gotify:
+    image: ghcr.io/gotify/server:latest
+    container_name: gotify
+    profiles: [disabled]
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/gotify/data:/app/data
+    environment:
+      - TZ=${TZ}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.gotify.rule=Host(`gotify.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.gotify.entrypoints=websecure
+      - traefik.http.routers.gotify.middlewares=myipwhitelist@file
+      - traefik.http.services.gotify.loadbalancer.server.port=80
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+.\\d+.\\d{0,}|latest)$$
+
+######### PASSWORD MANAGER ##########
+
+# Vaultwarden - Bitwarden server API written in rust
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    #profiles: [disabled]
+    restart: unless-stopped
+    environment:
+      - WEBSOCKET_ENABLED=true  # Enable WebSocket notifications.
+    volumes:
+      - ${CONFIG_DIR}/vaultwarden:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.vaultwarden.rule=Host(`vaultwarden.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.vaultwarden.entrypoints=websecure
+      - traefik.http.routers.vaultwarden.service=vaultwarden
+      - traefik.http.routers.vaultwarden.middlewares=myipwhitelist@file
+      - traefik.http.services.vaultwarden.loadbalancer.server.port=80
+      - traefik.http.routers.vaultwarden-websocket.rule=Host(`vaultwarden.${LOCAL_DOMAIN}`) && Path(`/notifications/hub`)
+      - traefik.http.routers.vaultwarden-websocket.entrypoints=websecure
+      - traefik.http.routers.vaultwarden-websocket.middlewares=myipwhitelist@file
+      - traefik.http.routers.vaultwarden-websocket.service=vaultwarden-websocket
+      - traefik.http.services.vaultwarden-websocket.loadbalancer.server.port=3012
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+\\.\\d+\\.*\\d{0,}|latest)$$
+
+######### CLOUD STORAGE ##########
+
+# Owncloud Infinite Scale - Cloud Storage
+  ocis:
+    image: owncloud/ocis:1.18.0
+    container_name: ocis
+    profiles: [disabled]
+    restart: unless-stopped
+    #entrypoint:
+    #- /bin/sh
+    #- /entrypoint-override.sh
+    volumes:
+      #- ${CONFIG_DIR}/ocis/entrypoint-override.sh:/entrypoint-override.sh
+      - ${CONFIG_DIR}/ocis-data:/var/lib/ocis
+    environment:
+      - OCIS_URL=https://ocis.${LOCAL_DOMAIN}
+      #- OCIS_LOG_LEVEL=error
+      - PROXY_TLS=false
+      # INSECURE: needed if oCIS / Traefik is using self generated certificates
+      - OCIS_INSECURE=${INSECURE:-false}
+      - IDP_LDAP_BIND_PASSWORD=${IDP_LDAP_BIND_PASSWORD:-idp}
+      - STORAGE_LDAP_BIND_PASSWORD=${STORAGE_LDAP_BIND_PASSWORD:-reva}
+      - OCIS_JWT_SECRET=${OCIS_JWT_SECRET:-Prive-Fumkiu4}
+      - STORAGE_TRANSFER_SECRET=${STORAGE_TRANSFER_SECRET:-replace-me-with-a-transfer-secret}
+      - OCIS_MACHINE_AUTH_API_KEY=${OCIS_MACHINE_AUTH_API_KEY:-change-me-please}
+      # basic auth (not recommended, but needed for eg. WebDav clients that do not support OpenID Connect)
+      #- PROXY_ENABLE_BASIC_AUTH=${PROXY_ENABLE_BASIC_AUTH:-false}
+      - ACCOUNTS_DEMO_USERS_AND_GROUPS=false
+      - OCIS_LOG_PRETTY=true
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ocis.rule=Host(`ocis.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.ocis.entrypoints=websecure
+      - traefik.http.routers.ocis.middlewares=myipwhitelist@file
+      - traefik.http.services.ocis.loadbalancer.server.port=9200
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+\\.\\d+\\.*\\d{0,}|latest)$$
+
+# Nextcloud - Your Own Cloud Storage
+  nextcloud:
+    image: ghcr.io/linuxserver/nextcloud:latest
+    container_name: nextcloud
+    #profiles: [disabled]
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+      - redis
+    networks:
+      - default
+      - db
+    volumes:
+      - ${CONFIG_DIR}/nextcloud:/config
+      - ${DATA_DIR}/${USER_NAME}/Nextcloud:/data
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - REDIS_HOST=redis
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=docker_default
+      - traefik.http.routers.nextcloud.rule=Host(`nextcloud.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.nextcloud.entrypoints=websecure
+      - traefik.http.routers.nextcloud.middlewares=myipwhitelist@file
+      - traefik.http.services.nextcloud.loadbalancer.server.port=443
+      # Use https for traefik to nc communication because this image uses https only
+      - traefik.http.services.nextcloud.loadbalancer.server.scheme=https # Use this with insecureskipverify
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(\\d+\\.\\d+\\.\\d{0,}-php8|php8)$$
+
+# MariaDB - MySQL Database
+  mariadb:
+    image: mariadb:10.5
+    container_name: mariadb
+    #profiles: [disabled]
+    restart: unless-stopped
+    networks:
+      - db
+    volumes:
+      - ${CONFIG_DIR}/mariadb:/var/lib/mysql
+    command: --transaction-isolation=READ-COMMITTED --log-bin=msqyld-bin --binlog-format=ROW
+    environment:
+      - MYSQL_ROOT_PASSWORD_FILE=/run/secrets/db_root_password
+      - MYSQL_USER=${USER_NAME}
+      - MYSQL_PASSWORD_FILE=/run/secrets/db_password
+      - MYSQL_DATABASE=nextcloud
+    secrets:
+      - db_root_password
+      - db_password
+
+# Redis Cache - speed up lookup transactions
+  redis:
+    image: redis:6.2-alpine
+    container_name: redis
+    #profiles: [disabled]
+    restart: unless-stopped
+    networks:
+      - db
+    volumes:
+      - ${CONFIG_DIR}/redis:/data
+
+
+######### TESTING ##########
+
+# Whoami - Test
+  whoami:
+    image: traefik/whoami
+    container_name: whoami
+    profiles: [disabled]
+    restart: unless-stopped
+    # networks:
+    #   - default # NEED A TESTING NETWORK
+    # ports:
+    #   - "8080:8080"
+    environment:
+      - WHOAMI_PORT_NUMBER=8080
+      - WHOAMI_NAME=IAMYOU
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`whoami.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.whoami.entrypoints=websecure
+      - traefik.http.routers.whoami.middlewares=myipwhitelist@file
+      - traefik.http.services.whoami.loadbalancer.server.port=8080
+
