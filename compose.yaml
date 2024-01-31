@@ -38,7 +38,7 @@ services:
   socket-proxy:
     image: tecnativa/docker-socket-proxy:latest
     container_name: socket-proxy
-    # profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     networks:
       - socket_net
@@ -54,9 +54,9 @@ services:
 
   # Traefik - Reverse Proxy
   traefik:
-    image: traefik:v2.9
+    image: traefik:v2.10
     container_name: traefik
-    # profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     depends_on:
       - socket-proxy
@@ -129,14 +129,28 @@ services:
       - diun.max_tags=2
       - diun.include_tags=^(\\d+.\\d+.\\d{0,}|latest)$$
 
+  # FlareSolverr - proxy server to bypass Cloudflare and DDoS-Guard protection
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    profiles: [gluetun]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
+    # ports:
+    #   - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+
 
 ######### VPN ##########
 
   # Gluetun VPN Client
   gluetun:
-    image: qmcgaw/gluetun:v3.32
+    image: qmcgaw/gluetun:v3.37
     container_name: gluetun
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
@@ -144,6 +158,8 @@ services:
       - /dev/net/tun:/dev/net/tun
     ports:
       - "8888:8888/tcp" # HTTP proxy
+      - "1080:1080/tcp" # Socks5 proxy
+      - "1080:1080/udp" # Socks5 proxy
     volumes:
       - ${CONFIG_DIR}/gluetun:/gluetun
     environment:
@@ -152,15 +168,61 @@ services:
       - TZ=${TZ}
       - VERSION_INFORMATION=off
       - UPDATER_PERIOD=24h # Update VPN Server ip addresses
-      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER}
+      - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=wireguard
-      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - WIREGUARD_ADDRESSES=${VPN_SERVER_WIREGUARD_ADDRESS}
-      - SERVER_CITIES=${VPN_SERVER}
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_PROVIDER=${VPN_PROVIDER}
       # - FIREWALL=off
       # - FIREWALL_DEBUG=on
-      - FIREWALL_VPN_INPUT_PORTS=${VPN_INPUT_PORT}
-      - FIREWALL_OUTBOUND_SUBNETS=172.18.0.99/32 # Allow connection to calibre
+      - FIREWALL_OUTBOUND_SUBNETS=172.18.0.99/32,172.18.0.89/32,192.168.0.103/32 # Allow connection to calibre, bazarr, kodi
+      # - HTTPPROXY=on
+      # - HTTPPROXY_LOG=off
+      # - HTTPPROXY_USERNAME=/run/secrets/web_username
+      # - HTTPPROXY_PASSWORD=/run/secrets/web_password
+    secrets:
+      - web_username
+      - web_password
+    labels:
+      # TRAEFIK
+      - traefik.enable=true
+      - traefik.http.routers.gluetun.rule=Host(`gluetun.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.gluetun.entrypoints=websecure
+      - traefik.http.routers.gluetun.middlewares=myipwhitelist@file
+      - traefik.http.services.gluetun.loadbalancer.server.port=8000
+      # DIUN
+      - diun.watch_repo=true
+      - diun.max_tags=2
+      - diun.include_tags=^(v\\d+.\\d+.\\d{0,}|latest)$$
+
+  # Gluetun VPN Client
+  gluetun-1:
+    image: qmcgaw/gluetun:v3.37
+    container_name: gluetun-1
+    profiles: [disabled]
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    # devices:
+    #   - /dev/net/tun:/dev/net/tun
+    ports:
+      - "7777:8888/tcp" # HTTP proxy
+    volumes:
+      - ${CONFIG_DIR}/gluetun-1:/gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VERSION_INFORMATION=off
+      - UPDATER_PERIOD=24h # Update VPN Server ip addresses
+      - VPN_SERVICE_PROVIDER=${VPN_PROVIDER}
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY_1}
+      - WIREGUARD_ADDRESSES=${VPN_SERVER_WIREGUARD_ADDRESS_1}
+      - SERVER_CITIES=${VPN_SERVER_1}
+      # - FIREWALL=off
+      # - FIREWALL_DEBUG=on
+      # - FIREWALL_VPN_INPUT_PORTS=${VPN_INPUT_PORT}
+      # - FIREWALL_OUTBOUND_SUBNETS=172.18.0.99/32,192.168.0.103/32 # Allow connection to calibre, kodi
       - HTTPPROXY=on
       - HTTPPROXY_STEALTH=on
       #- HTTPPROXY_LOG=on
@@ -170,19 +232,25 @@ services:
     secrets:
       - web_username
       - web_password
-    labels:
-      - diun.watch_repo=true
-      - diun.max_tags=2
-      - diun.include_tags=^(v\\d+.\\d+.\\d{0,}|latest)$$
+
+# Socks5 Proxy
+  socks5:
+    image: serjs/go-socks5-proxy:latest
+    container_name: socks5
+    profiles: [gluetun]
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      - gluetun
 
 
 ######### DOWNLOADERS ##########
 
 # Transmission Bittorrent Client
   transmission:
-    image: ghcr.io/linuxserver/transmission
+    image: lscr.io/linuxserver/transmission:latest
     container_name: transmission
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -205,14 +273,37 @@ services:
       - diun.max_tags=2
       - diun.include_tags=^(\\d+\\.\\d+\\d{0,}-r\\d-ls\\d{0,}|latest)$$
 
+# Deemix - Download Music from Deezer
+  deemix:
+    image: registry.gitlab.com/bockiii/deemix-docker
+    container_name: deemix
+    profiles: [disabled]
+    restart: unless-stopped
+    # network_mode: service:gluetun
+    # depends_on:
+      # - gluetun
+    volumes:
+      - ${DOWNLOAD_DIR}/deemix:/downloads
+      - ${CONFIG_DIR}/deemix:/config
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DEEMIX_SINGLE_USER=true
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.deemix.rule=Host(`deemix.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.deemix.entrypoints=websecure
+      - traefik.http.routers.deemix.middlewares=myipwhitelist@file
+      - traefik.http.services.deemix.loadbalancer.server.port=6595
+
 
 ######### SEARCHERS ##########
 
 # Prowlarr – Torrent Proxy / Indexer
   prowlarr:
-    image: ghcr.io/linuxserver/prowlarr:develop
+    image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -239,9 +330,9 @@ services:
 
 # Sonarr – TV Show Download and Management
   sonarr:
-    image: ghcr.io/linuxserver/sonarr:latest
+    image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -267,9 +358,9 @@ services:
 
 # Radarr – Movie Download and Management
   radarr:
-    image: ghcr.io/linuxserver/radarr
+    image: lscr.io/linuxserver/radarr
     container_name: radarr
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -294,9 +385,9 @@ services:
 
 # Lidarr – Music Download and Management
   lidarr:
-    image: ghcr.io/linuxserver/lidarr
+    image: lscr.io/linuxserver/lidarr
     container_name: lidarr
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -304,7 +395,7 @@ services:
     volumes:
       - ${CONFIG_DIR}/lidarr:/config
       - ${DOWNLOAD_DIR}:/downloads
-      - ${MEDIA_DIR}/Music:/music
+      - ${MEDIA_DIR}/Music/Lidarr:/music
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -321,9 +412,9 @@ services:
 
 # Readarr – Book Download and Management
   readarr:
-    image: ghcr.io/linuxserver/readarr:nightly
+    image: lscr.io/linuxserver/readarr:develop
     container_name: readarr
-    #profiles: [disabled]
+    profiles: [disabled]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -349,9 +440,9 @@ services:
 
 # Bazarr – Subtitle Download and Management
   bazarr:
-    image: ghcr.io/linuxserver/bazarr
+    image: lscr.io/linuxserver/bazarr
     container_name: bazarr
-    #profiles: [disabled]
+    profiles: [gluetun]
     restart: unless-stopped
     network_mode: service:gluetun
     depends_on:
@@ -375,11 +466,36 @@ services:
       - diun.max_tags=2
       - diun.include_tags=^(v\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
 
+# Whisperasr
+  whisperasr:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: whisperasr
+    profiles: [gluetun]
+    depends_on:
+      - gluetun
+    restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.18.0.89 # set static ip so bazarr can connect
+    ports:
+      - "9000:9000"
+    environment:
+      - ASR_MODEL=small
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.whisperasr.rule=Host(`whisperasr.${LOCAL_DOMAIN}`)
+    #   - traefik.http.routers.whisperasr.entrypoints=websecure
+    #   - traefik.http.routers.whisperasr.middlewares=myipwhitelist@file
+    #   - traefik.http.services.whisperasr.loadbalancer.server.port=9000
+    #   - diun.watch_repo=true
+    #   - diun.max_tags=2
+    #   - diun.include_tags=^(v\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
 # Calibre – Ebook management
   calibre:
-    image: ghcr.io/linuxserver/calibre:latest
+    image: lscr.io/linuxserver/calibre:latest
     container_name: calibre
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     networks:
       default:
@@ -387,6 +503,10 @@ services:
     volumes:
       - ${CONFIG_DIR}/calibre:/config
       - ${MEDIA_DIR}/Calibre Library:/data/Calibre Library
+      - ${DOWNLOAD_DIR}:/downloads
+      - ${MEDIA_DIR}/Manga:/manga
+      # - /media/Kindle:/mnt
+      - /media/onyto:/mnt
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -399,39 +519,49 @@ services:
       - traefik.http.routers.calibre.rule=Host(`calibre.${LOCAL_DOMAIN}`)
       - traefik.http.routers.calibre.entrypoints=websecure
       - traefik.http.routers.calibre.middlewares=myipwhitelist@file
+      - traefik.http.routers.calibre.service=calibre
       - traefik.http.services.calibre.loadbalancer.server.port=8080
+      - traefik.http.routers.calibrecs.rule=Host(`calibrecs.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.calibrecs.entrypoints=websecure
+      - traefik.http.routers.calibrecs.middlewares=myipwhitelist@file
+      - traefik.http.routers.calibrecs.service=calibrecs
+      - traefik.http.services.calibrecs.loadbalancer.server.port=8081
       - diun.watch_repo=true
       - diun.max_tags=2
       - diun.include_tags=^(v\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
 
-# Deemix - Download Music from Deezer
-  deemix:
-    image: registry.gitlab.com/bockiii/deemix-docker
-    container_name: deemix
+# Beets - media library management system for music
+  beets:
+    image: lscr.io/linuxserver/beets:latest
+    container_name: beets
     profiles: [disabled]
     restart: unless-stopped
-    network_mode: service:gluetun
-    depends_on:
-      - gluetun
+    # network_mode: service:gluetun
+    # depends_on:
+      # - gluetun
     volumes:
-      - ${DOWNLOAD_DIR}/deemix:/downloads
-      - ${CONFIG_DIR}/deemix:/config
+      - ${MEDIA_DIR}/Music-beets:/music
+      - ${DOWNLOAD_DIR}/beets:/downloads
+      - ${CONFIG_DIR}/beets:/config
     environment:
+      - TZ=${TZ} 
       - PUID=${PUID}
       - PGID=${PGID}
-      - DEEMIX_SINGLE_USER=true
     labels:
       - traefik.enable=true
-      - traefik.http.routers.deemix.rule=Host(`deemix.${LOCAL_DOMAIN}`)
-      - traefik.http.routers.deemix.entrypoints=websecure
-      - traefik.http.routers.deemix.middlewares=myipwhitelist@file
-      - traefik.http.services.deemix.loadbalancer.server.port=6595
+      - traefik.http.routers.beets.rule=Host(`beets.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.beets.entrypoints=websecure
+      - traefik.http.routers.beets.middlewares=myipwhitelist@file
+      - traefik.http.services.beets.loadbalancer.server.port=8337
+
+
+######### APPS ##########
 
 # FreshRSS - RSS feed aggregator
   freshrss:
-    image: ghcr.io/linuxserver/freshrss:latest
+    image: lscr.io/linuxserver/freshrss:latest
     container_name: freshrss
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     volumes:
       - ${CONFIG_DIR}/freshrss:/config
@@ -451,9 +581,9 @@ services:
 
 # Jellyfin - Free Software Media System
   jellyfin:
-    image: ghcr.io/linuxserver/jellyfin:latest
+    image: lscr.io/linuxserver/jellyfin:latest
     container_name: jellyfin
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     ports:
       - "8096:8096"
@@ -469,6 +599,8 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+      # This mod adds opencl-intel to jellyfin, to be installed/updated during container start.
+      - DOCKER_MODS=linuxserver/mods:jellyfin-opencl-intel
     labels:
       - traefik.enable=true
       - traefik.http.routers.jellyfin.rule=Host(`jellyfin.${LOCAL_DOMAIN}`)
@@ -477,6 +609,40 @@ services:
       - diun.watch_repo=false
       - diun.max_tags=2
       # - diun.include_tags=^(\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    profiles: [default]
+    user: 1000:1000 # should be owner of volumes
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/navidrome:/data
+      - ${MEDIA_DIR}/Music:/music:ro
+    environment:
+      - ND_SCANSCHEDULE=1h
+      - ND_LOGLEVEL=info
+      - ND_SESSIONTIMEOUT=336h
+      - ND_UILOGINBACKGROUNDURL=""
+      - ND_DEFAULTTHEME=Auto
+      - ND_ENABLETRANSCODINGCONFIG=true
+      - ND_ENABLECOVERANIMATION=false
+      - ND_ENABLEEXTERNALSERVICES=true
+      - ND_LASTFM_ENABLED=true
+      - ND_LASTFM_APIKEY=${LASTFM_APIKEY}
+      - ND_LASTFM_SECRET=${LASTFM_SECRET}
+      - ND_SPOTIFY_ID=${SPOTIFY_ID}
+      - ND_SPOTIFY_SECRET=${SPOTIFY_SECRET}
+      - ND_LISTENBRAINZ_ENABLED=false
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.navidrome.rule=Host(`navidrome.${LOCAL_DOMAIN}`)
+      - traefik.http.routers.navidrome.entrypoints=websecure
+      - traefik.http.services.navidrome.loadbalancer.server.port=4533
+      - diun.watch_repo=false
+      - diun.max_tags=2
+      # - diun.include_tags=^(\\d+.\\d+.\\d{0,}-ls\\d{0,}|latest)$$
+
 
 ######### NOTIFICATION ##########
 
@@ -528,7 +694,7 @@ services:
 
 # Gotify - a simple server for sending and receiving messages
   gotify:
-    image: ghcr.io/gotify/server:latest
+    image: lscr.io/gotify/server:latest
     container_name: gotify
     profiles: [disabled]
     restart: unless-stopped
@@ -552,7 +718,7 @@ services:
   vaultwarden:
     image: vaultwarden/server:latest
     container_name: vaultwarden
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     environment:
       - WEBSOCKET_ENABLED=true  # Enable WebSocket notifications.
@@ -565,11 +731,6 @@ services:
       - traefik.http.routers.vaultwarden.service=vaultwarden
       - traefik.http.routers.vaultwarden.middlewares=myipwhitelist@file
       - traefik.http.services.vaultwarden.loadbalancer.server.port=80
-      - traefik.http.routers.vaultwarden-websocket.rule=Host(`vaultwarden.${LOCAL_DOMAIN}`) && Path(`/notifications/hub`)
-      - traefik.http.routers.vaultwarden-websocket.entrypoints=websecure
-      - traefik.http.routers.vaultwarden-websocket.middlewares=myipwhitelist@file
-      - traefik.http.routers.vaultwarden-websocket.service=vaultwarden-websocket
-      - traefik.http.services.vaultwarden-websocket.loadbalancer.server.port=3012
       - diun.watch_repo=true
       - diun.max_tags=2
       - diun.include_tags=^(\\d+\\.\\d+\\.*\\d{0,}|latest)$$
@@ -615,9 +776,9 @@ services:
 
 # Nextcloud - Your Own Cloud Storage
   nextcloud:
-    image: ghcr.io/linuxserver/nextcloud:latest
+    image: lscr.io/linuxserver/nextcloud:version-28.0.1
     container_name: nextcloud
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     depends_on:
       - mariadb
@@ -632,7 +793,6 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
-      - REDIS_HOST=redis
     labels:
       - traefik.enable=true
       - traefik.docker.network=docker_default
@@ -650,7 +810,7 @@ services:
   mariadb:
     image: mariadb:10.5
     container_name: mariadb
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     networks:
       - db
@@ -670,7 +830,7 @@ services:
   redis:
     image: redis:6.2-alpine
     container_name: redis
-    #profiles: [disabled]
+    profiles: [default]
     restart: unless-stopped
     networks:
       - db
